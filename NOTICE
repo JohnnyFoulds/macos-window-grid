@@ -1,0 +1,17 @@
+This project builds on research and prior art from:
+
+- DeskPad (MIT) — https://github.com/Stengo/DeskPad
+  "A virtual monitor for screen sharing."
+  CGVirtualDisplay usage pattern and click-to-warp cursor model.
+
+- VirtualDisplayKit (MIT) — https://github.com/xocialize/VirtualDisplayKit
+  SwiftPM wrapper for CGVirtualDisplay; moveCursor(to:) pattern.
+
+- NotificationNanny — https://github.com/3rd-Musketeer/notification-nanny-focused-screen
+  Symbol declarations for CGSSetWindowTransform / SLSSetWindowTransform,
+  lifted with gratitude as the only documented cross-process transform attempt
+  known to build on SIP-enabled macOS.
+
+The SkyLight symbol inventory in this repo was derived by running
+`dyld_info -exports` on macOS 26.6.2 (Tahoe, arm64) and does not include
+any proprietary Apple material.
