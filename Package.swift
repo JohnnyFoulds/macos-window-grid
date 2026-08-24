@@ -74,5 +74,51 @@ let package = Package(
             dependencies: ["SkyLightBridge"],
             path: "Sources/Probe08"
         ),
+
+        // Tier 10 — CAContext rendering injection via overlay compositing group
+        //   SLSTransactionSetWindowCreatesOverlayCompositingGroup + SetWindowOverlayContext
+        //   with CAContext.localContextWithOptions contextId — can we render on any window?
+        .executableTarget(
+            name: "Probe09",
+            dependencies: ["SkyLightBridge"],
+            path: "Sources/Probe09"
+        ),
+
+        // Tier 11 — SLSGetWindowLayerContext / SLSSetWindowLayerContext injection
+        //   Get our own window's LAYER CONTEXT ID (the format SLSTransactionSetWindowOverlayContext expects)
+        //   Try passing it as overlay context on foreign window
+        //   Try SLSSetWindowLayerContext cross-process (direct layer hijack)
+        .executableTarget(
+            name: "Probe10",
+            dependencies: ["SkyLightBridge"],
+            path: "Sources/Probe10"
+        ),
+
+        // Tier 12 — Complete SLS layer context pipeline
+        //   CreateLayerContext → SetWindowLayerContext (own) → GetWindowLayerContext readback
+        //   → use returned ID as overlay context on foreign window
+        .executableTarget(
+            name: "Probe11",
+            dependencies: ["SkyLightBridge"],
+            path: "Sources/Probe11"
+        ),
+
+        // Tier 13 — CATransaction flush timing + SLSTransactionGetFencingContext
+        //   Hypothesis: CAContext.contextId is valid but must be committed/flushed
+        //   to CARenderServer before WindowServer knows about it
+        .executableTarget(
+            name: "Probe12",
+            dependencies: ["SkyLightBridge"],
+            path: "Sources/Probe12"
+        ),
+
+        // Tier 14 — CARemoteLayerServer + CARenderContext properties
+        //   CARemoteLayerServer publishes a server-side render context
+        //   that may have the right properties for overlay context use
+        .executableTarget(
+            name: "Probe13",
+            dependencies: ["SkyLightBridge"],
+            path: "Sources/Probe13"
+        ),
     ]
 )

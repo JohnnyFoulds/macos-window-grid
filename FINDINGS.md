@@ -370,9 +370,9 @@ and hardened user apps are all protected.
 
 ---
 
-## Conclusion
+## Conclusion — Approach A
 
-**Approach A (GPU compositor transform) is definitively not viable with SIP enabled.**
+**Approach A (GPU compositor transform AND overlay injection) is definitively not viable with SIP enabled.**
 
 Every known compositor transform entry point in SkyLight has been tested via:
 - Direct calls (CGS and SLS variants)
@@ -386,46 +386,122 @@ Every known compositor transform entry point in SkyLight has been tested via:
 - Owner CID passthrough (port identity check defeats it)
 - Parent-child transform inheritance (compositor does not propagate)
 - Plugin rendering unrestricted flag (does not bypass transform check)
-- Overlay compositing group (accepted, but does not bypass transform check)
+- Overlay compositing group (accepted, but visual injection confirmed BLOCKED — see Phase 3b below)
 
 The wall is precisely:
 - **Type:** Server-side ownership check in WindowServer via mach port identity
 - **The only bypass:** `com.apple.private.skylight.universal-owner` entitlement (Apple-only),
   OR code injection into Dock.app (requires SIP partially disabled, as yabai documents)
 
-### Novel findings (previously undocumented)
+---
 
-1. **Overlay compositing group is accepted cross-process** — `SLSTransactionSetWindowCreatesOverlayCompositingGroup` and `SLSTransactionSetWindowOverlayContext` both accepted without ownership check. A layer context created via `SLSCreateLayerContext` can be registered as an overlay on any window.
+## Phase 3b — Overlay rendering injection exhaustive attempt (Probes 08–13)
 
-2. **`SLSCreateLayerContext` signature** — takes 3 args (cid, ptr1, ptr2); crashes with 2.
+### Context ID formats tested against SLSTransactionSetWindowOverlayContext
 
-3. **Transaction opcode table** — complete encoding of all SkyLight transaction opcodes with their semantic purpose and cross-process behavior.
+| Context ID source | Value range | Overlay visual result |
+| --- | --- | --- |
+| `CAContext.localContextWithOptions:` contextId | ~1.75B range (UInt32) | No visual change |
+| `CAContext.contextWithCGSConnection:` contextId | ~600M range | No visual change |
+| `SLSCreateLayerContext` id2 (slot index) | ~50K range | No visual change |
+| `SLSCreateLayerContext` id1 as UInt32 | large neg as unsigned | No visual change |
+| `SLSTransactionGetFencingContext` return value | ~87M range | No visual change |
+| `CACFContextCreate` → `CARenderContextGetId` | ~2.26B | No visual change |
+| CAContext.contextId after CATransaction.flush() | same ~1.75B | No visual change |
+| CAContext.contextId after 2s run loop wait | same | No visual change |
+| contextId=0 (clear/null) | 0 | Accepted (commits fine, no overlay = expected) |
 
-4. **`SLSSetWindowWarp` direct variant has ownership check** — unlike the transaction variant (no client-side check), the direct warp function has `CGSWindowGetMappedImpl`.
+**Definitive visual test (Probe13 / overlay_visual_test):**  
+Our own cyan window with overlay context set to a CAContext containing a full-size bright red layer with "OVERLAY WORKS!!" text → window remains **CYAN** after overlay transaction commit.
 
-5. **CATransform3D vs CGAffineTransform readback gap** — `SLSTransactionSetWindowTransform3D` changes the 3D transform (16 doubles), which is NOT reflected in `SLSGetWindowTransform` (2D affine readback). Different compositor properties.
+### SLSTransactionCommit return values
 
-6. **Warp mesh is a 1D displacement field** — `rows * cols` scalar floats, NOT 2D coordinate pairs. Likely for single-axis deformation effects (genie). Cannot represent arbitrary 2D scale.
+`SLSTransactionCommit` return value is **NOT** an OSStatus error code. It is a signed 32-bit
+transaction sequence counter (increments by 256 per commit). Both "accepted" and "rejected"
+overlay transactions return the same kind of positive/negative large integers. Commit status
+CANNOT be used to determine overlay acceptance — visual observation is the only ground truth.
 
-7. **Obsidian DYLD injection confirmed viable** — `com.apple.security.cs.disable-library-validation` entitlement present; launching Obsidian with `DYLD_INSERT_LIBRARIES` loads unsigned dylibs.
+### CARenderContext properties (from CARenderContextById)
+
+```
+CAContext.contextId → CARenderContextById returns VALID pointer ✓
+  procId = our PID
+  opts   = 0x0
+  level  = -573849600  (anomalous — not a standard window level)
+  hostCtxId = 0
+  displayId = 0         ← NOT bound to any display
+```
+
+The context exists in CARenderServer's table (CARenderContextById finds it), but
+the WindowServer compositor refuses to use it as a window overlay. Likely reasons:
+- `displayId=0`: not bound to a specific display/screen
+- `level` outside valid overlay range
+- Requires specific options flags (registry as overlay context vs normal render context)
+- May need to originate from a privileged connection (Dock.app / universal-owner)
+
+### SLSSetWindowLayerContext third argument is an ObjC object
+
+`SLSSetWindowLayerContext(cid, wid, thirdArg)` — the `thirdArg` is an ObjC object pointer.
+Passing a raw UInt32 (e.g., id2=47651) causes an immediate crash in `objc_msgSend` because
+the integer is treated as an object pointer and `retain` is called on address 0xBA23 (not mapped).
+The ObjC class is unknown (not exported from SkyLight). This API is not directly usable.
+
+### SLSGetWindowLayerContext
+
+`SLSGetWindowLayerContext(cid, wid) -> UInt32` returns 0 for ALL regular application windows.
+Normal app windows do not have a "layer context" set. Layer contexts appear to be used only
+by privileged system processes (status bar items, overlays managed by Dock.app).
+
+### CARemoteLayerServer
+
+`CARemoteLayerServer` is the correct cross-process CA layer publishing mechanism. However:
+- Requires AppKit (returns nil in CLI processes)
+- In AppKit, `+new` and `+serverWithKey:` crashed with `doesNotRecognizeSelector` on this OS version
+- Could not instantiate to test its contextId as overlay context
 
 ---
 
-## Next: decide fallback approach
+## Novel findings (previously undocumented)
 
-1. **B — Virtual displays + ScreenCaptureKit + cursor warp / CoreHID input**  
-   `CGVirtualDisplay` (SIP-safe, used by BetterDisplay/FreeDisplay). Each app is genuinely
-   full-screen on its own display → no reflow. Core challenge: cursor model.
-   Risk: VirtualDisplayKit warns SCK struggles with multiple virtual displays.
+1. **`SLSTransactionCommit` returns sequence numbers** — all positive/negative large integers are sequence counters, NOT error codes. Only way to know if overlay worked is visual.
 
-2. **C — Window capture + `CGEventPostToPid` for input**  
-   No virtual displays; simpler setup. Risk: occlusion throttling, per-app input rejection.
+2. **`CARenderContextById(CAContext.contextId)` returns valid pointer** — CAContext IDs map to valid CARenderContext entries in QuartzCore's table. The render context EXISTS but is not accepted for window overlay use by WindowServer.
 
-3. **Overlay injection + ScreenCaptureKit rendering**  
-   Novel: use the accepted `SLSTransactionSetWindowCreatesOverlayCompositingGroup` +
-   `SLSTransactionSetWindowOverlayContext` path to inject a rendering context on any window,
-   then render a scaled SCK capture into it. The foreign window is moved off-screen (virtual
-   display). This delivers scaled content IN the compositor layer stack, not as a separate window.
-   Still needs input forwarding.
+3. **Overlay compositing group is accepted cross-process** — opcodes 0x6b and 0x6e both accepted without ownership check — but no visual rendering injection results.
 
-4. **SIP partial disable** — gives Approach A fully. Requires user choice.
+4. **`SLSCreateLayerContext` signature** — takes 3 args (cid, ptr1, ptr2); crashes with 2.
+
+5. **Transaction opcode table** — complete encoding of all SkyLight transaction opcodes with their semantic purpose and cross-process behavior.
+
+6. **`SLSSetWindowWarp` direct variant has ownership check** — unlike the transaction variant (no client-side check), the direct warp function has `CGSWindowGetMappedImpl`.
+
+7. **CATransform3D vs CGAffineTransform readback gap** — `SLSTransactionSetWindowTransform3D` changes the 3D transform (16 doubles), which is NOT reflected in `SLSGetWindowTransform` (2D affine readback). Different compositor properties.
+
+8. **Warp mesh is a 1D displacement field** — `rows * cols` scalar floats, NOT 2D coordinate pairs. Likely for single-axis deformation effects (genie). Cannot represent arbitrary 2D scale.
+
+9. **Obsidian DYLD injection confirmed viable** — `com.apple.security.cs.disable-library-validation` entitlement present; launching Obsidian with `DYLD_INSERT_LIBRARIES` loads unsigned dylibs.
+
+10. **`SLSTransactionGetFencingContext`** — returns a valid fencing context ID from an uncommitted transaction. Marking a transaction as "fencing requested" makes it un-committable (assertion failure). The fencing context ID format does not match overlay context requirements.
+
+11. **`SLSSetWindowLayerContext` third arg is ObjC object** — not a UInt32. Passing raw integer crashes in objc_msgSend.
+
+12. **Dock.app does NOT import `SLSTransactionSetWindowOverlayContext`** directly — Mission Control uses a higher-level Bridged API (`SLSBridgedSpaceSetTransformOperation` etc.) or SkyLight-internal code.
+
+---
+
+## Decision: Approach A fully exhausted
+
+After 13 probes and exhaustive investigation, all Approach A paths are confirmed blocked:
+- Transform injection (all opcodes): blocked by server-side ownership (mach port identity)
+- Overlay rendering injection: accepted mach messages, no visual output produced
+- DYLD injection: only useful for the target app's OWN windows
+
+**The path forward is Approach B:**
+
+**B — Virtual displays + ScreenCaptureKit + input forwarding**  
+- `CGVirtualDisplay` (SIP-safe, used by BetterDisplay/FreeDisplay)
+- Each app genuinely full-screen on its own virtual display → no reflow
+- SCK captures each display
+- Scaled content displayed in a 2×2 grid window
+- Input: cursor warp on entry, `CGEventPostToPid` or CoreHID virtual device for click delivery
+- Known risk: SCK may struggle with 4 simultaneous virtual displays (VirtualDisplayKit warning)
