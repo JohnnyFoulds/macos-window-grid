@@ -264,13 +264,119 @@ check server-side for this message), but does not affect visual rendering.
 
 ---
 
+## Phase 3 — Transaction opcodes + DYLD injection audit (Probe08)
+
+### Complete transaction opcode table (confirmed via disassembly)
+
+| Opcode | Function | Server-side ownership check |
+| --- | --- | --- |
+| 0x08 | `SLSTransactionSetWindowProperty` | Unknown (not tested) |
+| 0x0e | `SLSTransactionSetWindowSystemAlpha` | YES — alpha blocked cross-process |
+| 0x0f | `SLSTransactionSetWindowTransform` | YES — blocked (Probe02+) |
+| 0x10 | `SLSTransactionSetWindowTransform3D` | YES — blocked cross-process |
+| 0x11 | `SLSTransactionSetWindowWarp` | YES — blocked cross-process (or no readback fn) |
+| 0x1d | `SLSTransactionSetSpaceShape` | n/a (space-level) |
+| 0x1e | `SLSTransactionSetSpaceAbsoluteLevel` | n/a (space-level) |
+| 0x6b | `SLSTransactionSetWindowOverlayContext` | **NO — accepted cross-process** |
+| 0x6e | `SLSTransactionSetWindowCreatesOverlayCompositingGroup` | **NO — accepted cross-process** |
+| 0x7b | `SLSTransactionSetPluginRenderingIsUnrestrictedForWindow` | YES-ish — flag set cross-process accepted, but does NOT bypass transform check |
+
+### Warp mesh encoding (opcode 0x11)
+
+`SLSTransactionSetWindowWarp(txn, wid, rows, cols, float_array)`:
+- `float_array` has `rows * cols` floats (one scalar value per grid point)
+- Each float is encoded as packed int (if integer-valued) or 5-byte float (0x88 prefix + 8 bytes)
+- This is likely a 1D per-axis displacement field (e.g., genie effect Y-axis deformation)
+- NOT a full 2D affine equivalent — arbitrary scale warp not possible in this format
+
+**Direct (non-transaction) `SLSSetWindowWarp` has `CGSWindowGetMappedImpl`** — client-side owned check, same as `SLSSetWindowTransform`.
+
+### SLSTransactionSetWindowTransform3D (opcode 0x10)
+
+- Signature: `(txn, wid, UnsafeRawPointer_to_CATransform3D_16_doubles)`
+- CATransform3D = 16 doubles (m11..m44, row-major, 128 bytes total)
+- `SLSGetWindowTransform` (2D affine readback) does NOT reflect 3D transform changes
+- Cross-process test: blocked — transform not applied
+
+### `SLSCreateLayerContext` correct signature
+
+```swift
+// x0 = cid, x1 = first output (Int32*), x2 = second output (Int32*)
+// CRASHES if x2 is nil — both output pointers are required
+typealias CreateLayerCtxFn = @convention(c) (Int32, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>) -> Int32
+```
+
+Returns status=0 with two distinct IDs. In testing:
+- ctxID=522455817 (SLS context ID)
+- ctxID2=61299 (CA context ID — small integer, likely slot in WindowServer's context table)
+
+### Overlay compositing group result
+
+Setting `SLSTransactionSetWindowCreatesOverlayCompositingGroup(txn, foreignWID, true)` and
+then `SLSTransactionSetWindowOverlayContext(txn, foreignWID, ourCtxID)` — **BOTH ACCEPTED
+without rejection** on a foreign window. The commit tokens are positive (not error codes).
+
+However: transform operations on the foreign window AFTER overlay setup remain blocked.
+The overlay flag does NOT grant transform rights; it only registers our context as an overlay
+layer on top of the window. No visual effect was observed (context may need explicit rendering
+to show anything).
+
+**The overlay path is novel and opens a rendering injection angle** (not a transform bypass):
+our context can potentially render content on top of any window.
+
+### DYLD injection audit
+
+| App | Location | CS Flags | DYLD injectable? |
+| --- | --- | --- | --- |
+| TextEdit | /System/Applications/ | platform binary, flags=0x0 | ✗ SIP strips DYLD vars |
+| Notes | /System/Applications/ | platform binary, flags=0x0 | ✗ SIP strips DYLD vars |
+| Chrome | /Applications/ | `kill,restrict,library-validation,runtime` | ✗ Hardened + restrict + lib-val |
+| VS Code | /Applications/ | `runtime`, no lib-val ent | ✗ Hardened, no disable-lib-val |
+| Obsidian | /Applications/ | `runtime` + `disable-library-validation` entitlement | **✓ DYLD injection possible** |
+
+**Obsidian DYLD injection is viable** but only useful for transforming Obsidian's own windows.
+DYLD injection into the target app (from within which `SLSMainConnectionID()` returns the
+process's own connection) would allow transforms on that process's windows — but system apps
+and hardened user apps are all protected.
+
+---
+
+## Complete bypass attempt table (Phase 1–3)
+
+| Approach | Result |
+| --- | --- |
+| `CGSSetWindowTransform` cross-process | Blocked (server-side ownership) |
+| `SLSSetWindowTransform` cross-process | Blocked (server-side ownership) |
+| `SLSTransactionSetWindowTransform` (0x0f) cross-process | Blocked |
+| `SLSTransactionSetWindowTransform3D` (0x10) cross-process | Blocked |
+| `SLSTransactionSetWindowWarp` (0x11) cross-process | Blocked |
+| `SLSTransactionSetWindowSystemAlpha` (0x0e) cross-process | Blocked |
+| `SLSSpaceSetTransform` | Blocked |
+| `SLSSetUniversalOwner` without entitlement | status=1002 |
+| Ad-hoc signing with private entitlement | AMFI kills (exit 137) |
+| Poke conn[0x1d] directly | No server-side effect |
+| `SLSSetWindowAlpha` cross-process | Blocked |
+| `SLSSetWindowLevel` cross-process | **WORKS** (z-order only) |
+| `SLSSetWindowParent` cross-process | **WORKS** (no transform inheritance) |
+| Parent-child transform inheritance | No inheritance in compositor |
+| `SLSPackagesAddWindowToDraggingSpace` cross-process | Mach msg accepted, no compositor change |
+| `SLSPackagesSetWindowDragTransform` cross-process | Drag layer only, not persistent compositor |
+| `SLSStructuralRegionSetChildRegionTransform` cross-process | status=0 but accessibility tree only, not rendering |
+| `SLSTransactionSetPluginRenderingIsUnrestrictedForWindow` + transform | Unrestricted flag set (accepted), transform still blocked |
+| `SLSTransactionSetWindowCreatesOverlayCompositingGroup` cross-process | **WORKS — accepted without ownership check** |
+| `SLSTransactionSetWindowOverlayContext` cross-process | **WORKS — accepted without ownership check** |
+| DYLD injection into Obsidian | **WORKS** (owns only Obsidian's windows) |
+| DYLD injection into TextEdit/Notes/Chrome/VSCode | Blocked |
+
+---
+
 ## Conclusion
 
 **Approach A (GPU compositor transform) is definitively not viable with SIP enabled.**
 
 Every known compositor transform entry point in SkyLight has been tested via:
 - Direct calls (CGS and SLS variants)
-- Transaction-wrapped calls
+- Transaction-wrapped calls (all opcodes 0x0f, 0x10, 0x11)
 - Space-level transform
 - Drag-space pipeline (separate layer, not persistent compositor)
 - Structural region transform (accessibility tree, not rendering)
@@ -279,11 +385,29 @@ Every known compositor transform entry point in SkyLight has been tested via:
 - conn[0x1d] memory poke (server-side check ignores it)
 - Owner CID passthrough (port identity check defeats it)
 - Parent-child transform inheritance (compositor does not propagate)
+- Plugin rendering unrestricted flag (does not bypass transform check)
+- Overlay compositing group (accepted, but does not bypass transform check)
 
 The wall is precisely:
 - **Type:** Server-side ownership check in WindowServer via mach port identity
 - **The only bypass:** `com.apple.private.skylight.universal-owner` entitlement (Apple-only),
   OR code injection into Dock.app (requires SIP partially disabled, as yabai documents)
+
+### Novel findings (previously undocumented)
+
+1. **Overlay compositing group is accepted cross-process** — `SLSTransactionSetWindowCreatesOverlayCompositingGroup` and `SLSTransactionSetWindowOverlayContext` both accepted without ownership check. A layer context created via `SLSCreateLayerContext` can be registered as an overlay on any window.
+
+2. **`SLSCreateLayerContext` signature** — takes 3 args (cid, ptr1, ptr2); crashes with 2.
+
+3. **Transaction opcode table** — complete encoding of all SkyLight transaction opcodes with their semantic purpose and cross-process behavior.
+
+4. **`SLSSetWindowWarp` direct variant has ownership check** — unlike the transaction variant (no client-side check), the direct warp function has `CGSWindowGetMappedImpl`.
+
+5. **CATransform3D vs CGAffineTransform readback gap** — `SLSTransactionSetWindowTransform3D` changes the 3D transform (16 doubles), which is NOT reflected in `SLSGetWindowTransform` (2D affine readback). Different compositor properties.
+
+6. **Warp mesh is a 1D displacement field** — `rows * cols` scalar floats, NOT 2D coordinate pairs. Likely for single-axis deformation effects (genie). Cannot represent arbitrary 2D scale.
+
+7. **Obsidian DYLD injection confirmed viable** — `com.apple.security.cs.disable-library-validation` entitlement present; launching Obsidian with `DYLD_INSERT_LIBRARIES` loads unsigned dylibs.
 
 ---
 
@@ -297,4 +421,11 @@ The wall is precisely:
 2. **C — Window capture + `CGEventPostToPid` for input**  
    No virtual displays; simpler setup. Risk: occlusion throttling, per-app input rejection.
 
-3. **SIP partial disable** — gives Approach A fully. Requires user choice.
+3. **Overlay injection + ScreenCaptureKit rendering**  
+   Novel: use the accepted `SLSTransactionSetWindowCreatesOverlayCompositingGroup` +
+   `SLSTransactionSetWindowOverlayContext` path to inject a rendering context on any window,
+   then render a scaled SCK capture into it. The foreign window is moved off-screen (virtual
+   display). This delivers scaled content IN the compositor layer stack, not as a separate window.
+   Still needs input forwarding.
+
+4. **SIP partial disable** — gives Approach A fully. Requires user choice.

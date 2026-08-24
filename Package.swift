@@ -66,5 +66,13 @@ let package = Package(
             dependencies: ["SkyLightBridge"],
             path: "Sources/Probe07"
         ),
+
+        // Tier 9 — Warp (0x11), 3D transform (0x10), overlay compositing group (0x6e),
+        //          plugin-unrestricted (0x7b), transaction alpha (0x0e) cross-process
+        .executableTarget(
+            name: "Probe08",
+            dependencies: ["SkyLightBridge"],
+            path: "Sources/Probe08"
+        ),
     ]
 )
