@@ -113,23 +113,7 @@ identical results.
 
 ## Tier 5 — Disassembly
 
-### What `SLSSetWindowTransformAtPlacement` actually does
-
-Disassembly of `SLSSetWindowTransform` at offset `0x33B38C` reveals it is a **thin wrapper**:
-
-```
-// Copy the CGAffineTransform to stack
-ldp q0, q1, [x2]      // x2 = pointer to input transform
-stp q0, q1, [sp]
-ldr q0, [x2, #0x20]
-str q0, [sp, #0x20]   // 48 bytes copied
-
-// Call the real function with placement=0, 0
-mov x4, sp            // x4 = stack copy pointer
-mov w2, #0
-mov w3, #0
-bl  SLSSetWindowTransformAtPlacement
-```
+### Ownership check mechanism
 
 Disassembly of `SLSSetWindowTransformAtPlacement` at offset `0x337D34`:
 
@@ -147,10 +131,9 @@ bl    voucher_mach_msg_set
 bl    mach_msg                      // SEND to WindowServer
 ```
 
-**There is NO client-side ownership check.** The function builds and sends a mach message
-to WindowServer unconditionally. WindowServer receives it and enforces ownership server-side
-by checking whether the sending mach port corresponds to a connection with `universal-owner`
-permission or ownership of the target window.
+The ownership check is **server-side** — WindowServer enforces it by checking whether
+the sending mach port corresponds to a connection with `universal-owner` permission or
+ownership of the target window.
 
 ### Dock.app's entitlement
 
@@ -158,10 +141,111 @@ permission or ownership of the target window.
 com.apple.private.skylight.universal-owner = true
 ```
 
-This entitlement, set at connection time, grants WindowServer permission to apply transform
-requests from that connection to **any** window. It is an Apple-private entitlement only
-available to Apple-signed binaries and therefore cannot be claimed by third-party processes
-on a SIP-enabled system.
+This entitlement grants WindowServer permission to apply transform requests from that
+connection to **any** window. It is an Apple-private entitlement only available to
+Apple-signed binaries.
+
+### Private entitlement cluster found in SkyLight strings
+
+```
+com.apple.private.skylight.universal-owner
+com.apple.private.skylight.privacy-indicator
+com.apple.private.skylight.assessment-agent
+com.apple.private.skylight.universal-control
+```
+
+### `SLSSetUniversalOwner` (offset 0x0034878C, mach msgid 0x1513)
+
+Sends msgid=0x1513 to WindowServer. Server checks `universal-owner` entitlement on the
+sending port. If OK, sends back confirmation and client sets `conn[0x1d] = 1`. Without
+the entitlement, returns status=1002.
+
+Attempt: ad-hoc signing with `com.apple.private.skylight.universal-owner` embedded via
+`codesign -s -`. AMFI kills the process at launch (exit 137 = SIGKILL) on SIP-enabled macOS
+before `main()` executes.
+
+---
+
+## Phase 2 — Exhaustive bypass attempts (Probe05–Probe07)
+
+### Attack A: SLSSetUniversalOwner direct call
+**Result:** status=1002 (server rejected — no entitlement)
+
+### Attack B: Poke conn[0x1d] directly  
+`CGSConnectionByID(cid)` at absolute address `0x18ea123c8`. Set byte at offset 0x1d to 1.  
+**Result:** No effect — ownership check is server-side via mach port identity, not this flag.
+
+### Attack C: SLSSetWindowAlpha cross-process
+**Result:** Blocked — same ownership model as transforms.
+
+### Attack D: SLSSetWindowLevel cross-process  
+**Result:** WORKS — z-ordering changes are intentionally more permissive in WindowServer.
+Level changes applied and read back correctly. Z-ordering only, not rendering transforms.
+
+### Attack E: SLSSetWindowParent cross-process  
+**Result:** WORKS (status=0) — foreign window can be parented to our window.
+BUT: parent-child transform inheritance does NOT propagate through the compositor.
+`SLSGetCatenatedWindowTransform` on child reads identity even when parent is scaled 0.5×.
+
+### Attack F: Packages drag-space pipeline (Probe07)
+
+**Disassembly confirmation:** Both `SLSPackagesAddWindowToDraggingSpace` (msgid=0x75E8)
+and `SLSPackagesSetWindowDragTransform` (msgid=0x76C9) have NO `CGSWindowGetMappedImpl`
+call client-side.
+
+`SLSPackagesAddWindowToDraggingSpace` includes WID in mach message body.  
+`SLSPackagesSetWindowDragTransform` does NOT include WID in body — applies to drag space globally.
+
+**Empirical test:**
+```
+addToDragSpace(ourCID, teWID)          → mach msg sent (no crash)
+setDragTransform(ourCID, ..., 0.5×)   → mach msg sent (no crash)
+SLSGetWindowTransform readback         → a=1.0 (no change)
+Visual observation                     → no visual change on screen
+```
+
+**Even on our own window:** drag transform does not affect `SLSGetWindowTransform` readback.
+The drag transform pipeline operates on a **separate compositing layer** used exclusively during
+window drag animations (Exposé/Mission Control drag gestures), not the persistent compositor
+window transform. The transform is not reflected in `SLSGetWindowTransform`.
+
+### Attack G: SLSStructuralRegionSetChildRegionTransform (Probe07)
+
+**Disassembly confirmation:** No `CGSWindowGetMappedImpl` call. Validates transform then
+sends msgid=0x76C0 with the region_id embedded in the message body.
+
+**Empirical test (WID passed as regionID):**
+```
+structuralRegionTransform(ourCID, teWID, &scale0.5)   → status=0 (accepted)
+SLSGetWindowTransform readback                          → a=1.0 (no change)
+structuralRegionTransform(ourCID, ourWID, &scale0.5)   → status=0 (accepted, own window)
+SLSGetWindowTransform readback on own window            → a=1.0 (no change)
+```
+
+**Conclusion:** The "structural region transform" is a property of the accessibility/hit-test
+tree, not the rendering compositor. It is accepted for both own and foreign windows (no ownership
+check server-side for this message), but does not affect visual rendering.
+
+---
+
+## Complete bypass attempt table
+
+| Approach | Result |
+| --- | --- |
+| `CGSSetWindowTransform` cross-process | Blocked (server-side ownership) |
+| `SLSSetWindowTransform` cross-process | Blocked (server-side ownership) |
+| `SLSTransactionSetWindowTransform` cross-process | Blocked |
+| `SLSSpaceSetTransform` | Blocked |
+| `SLSSetUniversalOwner` without entitlement | status=1002 |
+| Ad-hoc signing with private entitlement | AMFI kills (exit 137) |
+| Poke conn[0x1d] directly | No server-side effect |
+| `SLSSetWindowAlpha` cross-process | Blocked |
+| `SLSSetWindowLevel` cross-process | **WORKS** (z-order only) |
+| `SLSSetWindowParent` cross-process | **WORKS** (no transform inheritance) |
+| Parent-child transform inheritance | No inheritance in compositor |
+| `SLSPackagesAddWindowToDraggingSpace` cross-process | Mach msg accepted, no compositor change |
+| `SLSPackagesSetWindowDragTransform` cross-process | Drag layer only, not persistent compositor |
+| `SLSStructuralRegionSetChildRegionTransform` cross-process | status=0 but accessibility tree only, not rendering |
 
 ---
 
@@ -175,29 +259,35 @@ on a SIP-enabled system.
 | Read back window transform | ✓ Works | `SLSGetWindowTransform` |
 | Read space transform | ✓ Works | `SLSSpaceGetTransform` |
 | Hit-testing follows transform | ✗ No | Purely visual; input at original coords |
+| Add foreign window to drag space | ✓ Mach msg accepted | Drag layer only, no persistent effect |
+| Structural region transform cross-process | ✓ Mach msg accepted | Accessibility tree only |
 
 ---
 
 ## Conclusion
 
-**Approach A (GPU compositor transform) is not viable with SIP enabled.**
+**Approach A (GPU compositor transform) is definitively not viable with SIP enabled.**
 
-The wall is:
-- **Type:** Server-side ownership check in WindowServer (not in SkyLight)
-- **Enforcement mechanism:** Mach port identity — WindowServer checks the *sending port*
+Every known compositor transform entry point in SkyLight has been tested via:
+- Direct calls (CGS and SLS variants)
+- Transaction-wrapped calls
+- Space-level transform
+- Drag-space pipeline (separate layer, not persistent compositor)
+- Structural region transform (accessibility tree, not rendering)
+- SLSSetUniversalOwner (entitlement-blocked)
+- Ad-hoc entitlement signing (AMFI-killed)
+- conn[0x1d] memory poke (server-side check ignores it)
+- Owner CID passthrough (port identity check defeats it)
+- Parent-child transform inheritance (compositor does not propagate)
+
+The wall is precisely:
+- **Type:** Server-side ownership check in WindowServer via mach port identity
 - **The only bypass:** `com.apple.private.skylight.universal-owner` entitlement (Apple-only),
   OR code injection into Dock.app (requires SIP partially disabled, as yabai documents)
 
-**Also found:** Per-window CGS transforms are purely visual — input routing is unchanged.
-The Mission Control interactive thumbnail behaviour uses a different mechanism (likely
-`SLSSpaceSetTransform` which probably does affect hit-testing at the Space level).
-
 ---
 
-## Next: decide fallback
-
-Per the plan, the fallback choice is deferred until Phase 1 evidence is in.
-Options:
+## Next: decide fallback approach
 
 1. **B — Virtual displays + ScreenCaptureKit + cursor warp / CoreHID input**  
    `CGVirtualDisplay` (SIP-safe, used by BetterDisplay/FreeDisplay). Each app is genuinely

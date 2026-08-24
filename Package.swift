@@ -45,5 +45,26 @@ let package = Package(
             dependencies: ["SkyLightBridge"],
             path: "Sources/Probe04"
         ),
+
+        // Tier 6 — SLSSetUniversalOwner + conn flag poke + cross-process alpha
+        .executableTarget(
+            name: "Probe05",
+            dependencies: ["SkyLightBridge"],
+            path: "Sources/Probe05"
+        ),
+
+        // Tier 7 — parent-child transform inheritance
+        .executableTarget(
+            name: "Probe06",
+            dependencies: ["SkyLightBridge"],
+            path: "Sources/Probe06"
+        ),
+
+        // Tier 8 — Packages drag-space pipeline: AddWindowToDraggingSpace + SetWindowDragTransform
+        .executableTarget(
+            name: "Probe07",
+            dependencies: ["SkyLightBridge"],
+            path: "Sources/Probe07"
+        ),
     ]
 )
